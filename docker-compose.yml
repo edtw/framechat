@@ -1,0 +1,206 @@
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:16-alpine
+    container_name: afiliators-postgres
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_DB: afiliators
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres_dev_password_change_in_production
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - app-network
+
+  # Redis - Cache & Message Queue
+  redis:
+    image: redis:7-alpine
+    container_name: afiliators-redis
+    ports:
+      - "127.0.0.1:6379:6379"
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-redis_dev_password_change_in_production}
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-redis_dev_password_change_in_production}
+    healthcheck:
+      test: ["CMD", "redis-cli", "--no-auth-warning", "-a", "${REDIS_PASSWORD:-redis_dev_password_change_in_production}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - app-network
+
+  # Backend API Gateway (Port 3005)
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: afiliators-backend
+    ports:
+      - "127.0.0.1:3005:3005"
+    environment:
+      - NODE_ENV=development
+      - PORT=3005
+      - DATABASE_URL=postgresql://postgres:postgres_dev_password_change_in_production@postgres:5432/afiliators?schema=public
+      - REDIS_URL=redis://:redis_dev_password_change_in_production@redis:6379
+      - JWT_SECRET=${JWT_SECRET:-jwt_dev_secret_change_in_production_at_least_32_chars}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-sk-placeholder-dev-key}
+      - DEEPSEEK_MODEL=${DEEPSEEK_MODEL:-deepseek-chat}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:-dev_encryption_key_change_in_production_32chars}
+      - CORS_ORIGIN=http://localhost:3001,http://127.0.0.1:3001,http://frontend:3001
+      - BACKEND_API_KEY=${BACKEND_API_KEY:-backend_dev_api_key_change}
+      - AI_HANDLER_URL=http://ai-handler:8000
+      - WHATSAPP_SERVICE_API_KEY=${WHATSAPP_SERVICE_API_KEY:-whatsapp_service_dev_key_change}
+      - WHATSAPP_SERVICE_URL=http://whatsapp-service:3006
+      - DISCORD_SERVICE_URL=http://discord-service:3007
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - app-network
+    command: sh -c "npx prisma migrate deploy && node server.js"
+
+  # WhatsApp Service - Pure Baileys Microservice (Port 3006)
+  whatsapp-service:
+    build:
+      context: ./whatsapp-service
+      dockerfile: Dockerfile
+    container_name: afiliators-whatsapp-service
+    ports:
+      - "127.0.0.1:3006:3006"
+    environment:
+      - NODE_ENV=development
+      - PORT=3006
+      - BACKEND_URL=http://backend:3005
+      - BACKEND_API_KEY=${WHATSAPP_SERVICE_API_KEY:-whatsapp_service_dev_key_change}
+      - AI_HANDLER_URL=http://ai-handler:8000
+      - REDIS_URL=redis://:redis_dev_password_change_in_production@redis:6379
+      - CORS_ORIGIN=http://localhost:3001,http://localhost:3005,http://backend:3005
+      - SESSIONS_PATH=/app/sessions
+      - LOG_LEVEL=info
+    volumes:
+      - ./whatsapp-service:/app
+      - /app/node_modules
+      - whatsapp_sessions:/app/sessions
+    depends_on:
+      - backend
+    restart: unless-stopped
+    networks:
+      - app-network
+
+  # Discord Service (Port 3007) - self-bot assistant + engagement
+  discord-service:
+    build:
+      context: ./discord-service
+      dockerfile: Dockerfile
+    container_name: afiliators-discord-service
+    ports:
+      - "127.0.0.1:3007:3007"
+    environment:
+      - NODE_ENV=development
+      - PORT=3007
+      - BACKEND_URL=http://backend:3005
+      - BACKEND_API_KEY=${WHATSAPP_SERVICE_API_KEY:-whatsapp_service_dev_key_change}
+      - AI_HANDLER_URL=http://ai-handler:8000
+      - LOG_LEVEL=info
+      # ---- Engagement subsystem (proactive, approval-gated, heavily throttled) ----
+      - ENGAGEMENT_ENABLED=${ENGAGEMENT_ENABLED:-true}
+      - ENGAGEMENT_DISCOVERY_INTERVAL_MS=${ENGAGEMENT_DISCOVERY_INTERVAL_MS:-21600000}
+      - ENGAGEMENT_DISCOVERY_MAX_PER_RUN=${ENGAGEMENT_DISCOVERY_MAX_PER_RUN:-10}
+      - ENGAGEMENT_MAX_JOINS_PER_DAY=${ENGAGEMENT_MAX_JOINS_PER_DAY:-3}
+      - ENGAGEMENT_JOIN_INTERVAL_MS=${ENGAGEMENT_JOIN_INTERVAL_MS:-1800000}
+      - ENGAGEMENT_JOIN_DELAY_MIN_MS=${ENGAGEMENT_JOIN_DELAY_MIN_MS:-120000}
+      - ENGAGEMENT_JOIN_DELAY_MAX_MS=${ENGAGEMENT_JOIN_DELAY_MAX_MS:-600000}
+      - ENGAGEMENT_WARMUP_MS=${ENGAGEMENT_WARMUP_MS:-3600000}
+      - ENGAGEMENT_JOIN_MIN_RELEVANCE=${ENGAGEMENT_JOIN_MIN_RELEVANCE:-0.3}
+      - ENGAGEMENT_LOOP_INTERVAL_MS=${ENGAGEMENT_LOOP_INTERVAL_MS:-1200000}
+      - ENGAGEMENT_LOOP_JITTER_MS=${ENGAGEMENT_LOOP_JITTER_MS:-600000}
+      - ENGAGEMENT_PER_SERVER_DAILY_CAP=${ENGAGEMENT_PER_SERVER_DAILY_CAP:-2}
+      - ENGAGEMENT_PER_USER_COOLDOWN_MS=${ENGAGEMENT_PER_USER_COOLDOWN_MS:-43200000}
+      - ENGAGEMENT_RECENT_MESSAGE_LOOKBACK=${ENGAGEMENT_RECENT_MESSAGE_LOOKBACK:-30}
+      - ENGAGEMENT_PROPOSE_MIN_RELEVANCE=${ENGAGEMENT_PROPOSE_MIN_RELEVANCE:-0.35}
+      - ENGAGEMENT_SENDER_INTERVAL_MS=${ENGAGEMENT_SENDER_INTERVAL_MS:-300000}
+      - ENGAGEMENT_SENDER_BATCH=${ENGAGEMENT_SENDER_BATCH:-5}
+      - ENGAGEMENT_SEND_DELAY_MIN_MS=${ENGAGEMENT_SEND_DELAY_MIN_MS:-8000}
+      - ENGAGEMENT_SEND_DELAY_MAX_MS=${ENGAGEMENT_SEND_DELAY_MAX_MS:-45000}
+      - ENGAGEMENT_SEND_MAX_PER_HOUR=${ENGAGEMENT_SEND_MAX_PER_HOUR:-20}
+    volumes:
+      - ./discord-service:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+    restart: unless-stopped
+    networks:
+      - app-network
+
+  # AI Handler Service (Port 8000) - DeepSeek AI integration
+  ai-handler:
+    build:
+      context: ./ai-handler
+      dockerfile: Dockerfile
+    container_name: afiliators-ai-handler
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      - PORT=8000
+      - HOST=0.0.0.0
+      - DEBUG=False
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-sk-placeholder-dev-key}
+      - DEEPSEEK_MODEL=${DEEPSEEK_MODEL:-deepseek-chat}
+      - REDIS_URL=redis://:redis_dev_password_change_in_production@redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - app-network
+
+  # Frontend - Next.js Dashboard
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: afiliators-frontend
+    ports:
+      - "127.0.0.1:3001:3001"
+    environment:
+      - NODE_ENV=development
+      - NEXT_PUBLIC_API_URL=http://localhost:3005
+      - NEXT_TELEMETRY_DISABLED=1
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+    restart: unless-stopped
+    command: node .next/standalone/server.js
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  whatsapp_sessions:
+    driver: local

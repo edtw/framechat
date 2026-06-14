@@ -1,0 +1,17 @@
+node_modules/
+.next/
+dist/
+build/
+*.pyc
+__pycache__/
+.env
+*.env.local
+.env.production
+sessions/
+*.log
+.DS_Store
+docker-compose.override.yml
+postgres_data/
+redis_data/
+whatsapp_sessions/
+.claude/

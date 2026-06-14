@@ -1,0 +1,422 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-progress runs for the same ref (prevents queue buildup on fast pushes)
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────────
+  # 1. LINT — ESLint across frontend (and backend JS lint where configured)
+  # ────────────────────────────────────────────────────────────────────────────
+  lint:
+    name: Lint (ESLint)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci --legacy-peer-deps
+
+      - name: Run ESLint
+        working-directory: frontend
+        run: npm run lint
+
+      # Optionally lint the backend if the project adds an ESLint config there
+      # - name: Install backend dependencies
+      #   working-directory: backend
+      #   run: npm ci
+      # - name: Run backend lint
+      #   working-directory: backend
+      #   run: npx eslint . --ext .js
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # 2. TYPE CHECK — TypeScript compilation check for the frontend
+  # ────────────────────────────────────────────────────────────────────────────
+  typecheck:
+    name: Type Check (TypeScript)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci --legacy-peer-deps
+
+      - name: Run TypeScript compiler check
+        working-directory: frontend
+        run: npx tsc --noEmit
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # 3. UNIT TESTS — Vitest for frontend and backend (with Postgres service)
+  # ────────────────────────────────────────────────────────────────────────────
+  unit-tests:
+    name: Unit Tests (Vitest)
+    runs-on: ubuntu-latest
+    needs: [lint, typecheck]
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: afiliators_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres_test_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    strategy:
+      matrix:
+        service: [frontend, backend]
+      # Run both in parallel; do NOT fail-fast so both results are visible
+      fail-fast: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: ${{ matrix.service }}/package-lock.json
+
+      - name: Install dependencies (${{ matrix.service }})
+        working-directory: ${{ matrix.service }}
+        run: npm ci --legacy-peer-deps
+
+      # Backend needs Prisma client generated + DB migrated before tests
+      - name: Generate Prisma client & migrate (backend only)
+        if: matrix.service == 'backend'
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://postgres:postgres_test_password@localhost:5432/afiliators_test?schema=public
+        run: |
+          npx prisma generate
+          npx prisma migrate deploy
+
+      - name: Run Vitest (${{ matrix.service }})
+        working-directory: ${{ matrix.service }}
+        env:
+          # Backend env vars for tests
+          DATABASE_URL: postgresql://postgres:postgres_test_password@localhost:5432/afiliators_test?schema=public
+          JWT_SECRET: test_jwt_secret_min_32_chars_long
+          ENCRYPTION_KEY: test_encryption_key_32chars_min
+          REDIS_URL: redis://localhost:6379
+          PORT: '3005'
+        run: npm test
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # 4. E2E TESTS — Playwright end-to-end (PRs only)
+  # ────────────────────────────────────────────────────────────────────────────
+  e2e-tests:
+    name: E2E Tests (Playwright)
+    runs-on: ubuntu-latest
+    # Only run on pull requests (not on direct pushes to main)
+    if: github.event_name == 'pull_request'
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: afiliators_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres_test_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci --legacy-peer-deps
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Generate Prisma client & migrate
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://postgres:postgres_test_password@localhost:5432/afiliators_test?schema=public
+        run: |
+          npx prisma generate
+          npx prisma migrate deploy
+
+      - name: Seed test database
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://postgres:postgres_test_password@localhost:5432/afiliators_test?schema=public
+          JWT_SECRET: test_jwt_secret_min_32_chars_long
+          ENCRYPTION_KEY: test_encryption_key_32chars_min
+          REDIS_URL: redis://localhost:6379
+        run: node prisma/seed.js
+
+      - name: Start backend server
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://postgres:postgres_test_password@localhost:5432/afiliators_test?schema=public
+          JWT_SECRET: test_jwt_secret_min_32_chars_long
+          ENCRYPTION_KEY: test_encryption_key_32chars_min
+          REDIS_URL: redis://localhost:6379
+          PORT: '3005'
+        run: |
+          nohup node server.js > /tmp/backend.log 2>&1 &
+          echo "Waiting for backend to be ready..."
+          for i in $(seq 1 30); do
+            if curl -s http://localhost:3005/health > /dev/null 2>&1; then
+              echo "Backend is ready!"
+              break
+            fi
+            echo "Attempt $i/30 — waiting..."
+            sleep 2
+          done
+
+      - name: Install Playwright browsers
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+
+      - name: Run Playwright tests
+        working-directory: frontend
+        env:
+          NEXT_PUBLIC_API_URL: http://localhost:3005
+        run: npm run test:e2e
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: frontend/playwright-report/
+          retention-days: 7
+
+      - name: Upload Playwright traces on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-traces
+          path: frontend/test-results/
+          retention-days: 7
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # 5. BUILD CHECK — `next build` for the frontend
+  # ────────────────────────────────────────────────────────────────────────────
+  build-check:
+    name: Build Check (Next.js)
+    runs-on: ubuntu-latest
+    needs: [lint, typecheck, unit-tests]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci --legacy-peer-deps
+
+      - name: Build Next.js app
+        working-directory: frontend
+        run: npm run build
+
+      # Cache the build output so the Docker build can reuse it (via standalone)
+      - name: Cache .next build output
+        uses: actions/cache/save@v4
+        with:
+          path: frontend/.next
+          key: next-build-${{ github.sha }}
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # 6. DOCKER IMAGE BUILD VERIFICATION
+  # ────────────────────────────────────────────────────────────────────────────
+  docker-verify:
+    name: Docker Build Verification
+    runs-on: ubuntu-latest
+    needs: [build-check]
+
+    strategy:
+      matrix:
+        service:
+          - context: ./frontend
+            name: frontend
+          - context: ./backend
+            name: backend
+          - context: ./whatsapp-service
+            name: whatsapp-service
+          - context: ./ai-handler
+            name: ai-handler
+      fail-fast: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image — ${{ matrix.service.name }}
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.service.context }}
+          push: false
+          load: false
+          cache-from: type=gha,scope=${{ matrix.service.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service.name }}
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # 7. DOCKER COMPOSE SMOKE TEST (optional — validates full stack boots)
+  # ────────────────────────────────────────────────────────────────────────────
+  compose-smoke:
+    name: Docker Compose Smoke Test
+    runs-on: ubuntu-latest
+    needs: [docker-verify]
+    # Only run on pushes to main (not every PR) to save minutes
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: afiliators
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres_dev_password_change_in_production
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and start services
+        env:
+          DEEPSEEK_API_KEY: sk-ci-placeholder
+          DEEPSEEK_MODEL: deepseek-chat
+          JWT_SECRET: ci_jwt_secret_min_32_chars_for_testing
+          ENCRYPTION_KEY: ci_encryption_key_32_chars_minimum
+          REDIS_PASSWORD: redis_dev_password_change_in_production
+          BACKEND_API_KEY: ci_backend_api_key_test
+          WHATSAPP_SERVICE_API_KEY: ci_whatsapp_service_key_test
+        run: |
+          docker compose -f docker-compose.yml build \
+            --build-arg BUILDKIT_INLINE_CACHE=1
+          docker compose -f docker-compose.yml up -d
+          echo "Waiting for services to become healthy..."
+          sleep 30
+
+      - name: Health check — backend
+        run: |
+          for i in $(seq 1 15); do
+            STATUS=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3005/health || echo '000')
+            if [ "$STATUS" = "200" ]; then
+              echo "Backend is healthy (HTTP $STATUS)"
+              exit 0
+            fi
+            echo "Backend not ready (attempt $i/15, HTTP $STATUS) — waiting..."
+            sleep 4
+          done
+          echo "::error::Backend failed to become healthy"
+          docker compose -f docker-compose.yml logs backend
+          exit 1
+
+      - name: Health check — frontend
+        run: |
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3001 || echo '000')
+          if [ "$STATUS" = "200" ]; then
+            echo "Frontend is healthy (HTTP $STATUS)"
+          else
+            echo "::warning::Frontend returned HTTP $STATUS (may be expected in dev mode)"
+            docker compose -f docker-compose.yml logs frontend --tail 30
+          fi
+
+      - name: Health check — ai-handler
+        run: |
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/docs || echo '000')
+          echo "AI Handler /docs returned HTTP $STATUS"
+
+      - name: Collect logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.yml logs --tail 100
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.yml down -v --remove-orphans
